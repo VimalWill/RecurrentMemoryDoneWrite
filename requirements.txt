@@ -2,7 +2,6 @@
 # Qualified with Python 3.11 and CUDA 12.8.
 --extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.8.0
 numpy
 einops
 transformers
