@@ -86,7 +86,8 @@ def capture_kdn_calls(calls: list):
 
     def iso_capture(q, k, v, g_cumsum, beta, scale=None):
         out = iso_kernel(q, k, v, g_cumsum, beta, scale)
-        q_unit, k_unit = l2norm(q), l2norm(k)  # The kernel normalizes q and k itself.
+        # FLA stores normalized vectors at the input dtype before the recurrence.
+        q_unit, k_unit = (l2norm(x).to(x.dtype).float() for x in (q, k))
         calls.append(dict(
             kind="iso_kdn", q=q_unit, k=k_unit, v=v.float(), g_cumsum=g_cumsum.float(),
             write=beta.float()[..., None] * k_unit, out=out.float(),
