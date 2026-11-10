@@ -96,3 +96,55 @@ Paired standard errors use sequences as the sampling unit, not individual
 queries or heads. Small gains need replication. To repeat with a new seed,
 change both `--seed` and `--out` (for example, seed 1235 and a `seed1235` output
 directory); reusing a destination overwrites that checkpoint's earlier reports.
+
+## 3. Protect the final pair after confirming the boundary failure
+
+```bash
+python Expr/shrink_spread.py /path/to/checkpoint.pt \
+  --preset protect-pair --heads 8 --head-dim 64 --lr 1e-2 \
+  --out Expr/results/protect_pair_seed1234
+```
+
+This inference-only preset has **five settings per slice**: kernel, replay,
+ordinary key shrink, and two final-pair variants. Defaults remain 32 examples,
+seed 1234, slices `512:128,1024:256`, chunk 16, offset 0, past window 256,
+rank 1, gamma 0.1, eta 0. There is no spreading.
+
+- `keep_pair`: at the usual chunk boundary, shrink only the contributions from
+  tokens before the final pair. Accumulate those prefix writes separately and
+  decay them through the final two tokens using the normal per-channel decay.
+  Both final-pair token writes remain unchanged. The older pre-chunk carry also
+  remains unchanged. This is contribution preservation, not a guarantee that
+  removing other writes will leave the final association's readout intact.
+- `before_pair`: shrink the chunk's prefix update immediately before processing
+  the final pair. Both final-pair writes then execute normally, with their
+  residuals computed against the edited state. The direction estimator still
+  uses only history before the original chunk start. This changes edit timing;
+  it does not edit the entire accumulated state.
+
+Protection applies only to chunks wholly inside the KV context. Query/filler
+chunks and any chunk crossing the end of context use the ordinary shrink rule.
+The first chunk remains unedited, as does the final sequence chunk. With chunk
+16, the first affected read is token 32 for `keep_pair` and token 30 for
+`before_pair` (zero-based). No edit is delayed into the following chunk.
+
+The summary CSV now separates the final pairs (16, 24, ...), penultimate pairs
+(15, 23, ...), and all remaining pairs, with replay evaluated on matching groups.
+`other_accuracy` remains the original group excluding only final pairs;
+`earlier_accuracy` excludes both final and penultimate groups. The three latter
+disjoint groups are `terminal`, `penultimate`, and `earlier`.
+`edit_terminal_accuracy` tracks pairs immediately preceding the actual edit,
+which are the penultimate pairs for `before_pair`.
+
+Check whether final-pair recall recovers **without moving the loss to the
+penultimate pairs**, while preserving the earlier-pair gain and improving overall
+recall. The experiment tests that possibility; protection alone does not ensure it.
+
+Probe rows include `scheduled_chunk_end_exclusive` and `edit_token_index` to
+distinguish the original boundary from the earlier edit. For `before_pair`, the
+final pair has not been processed at probe time and is deliberately absent from
+the immediate before/after probes. `scheduled_penultimate_pair` identifies its
+preceding pair. `terminal_pair`, `tokens_before_boundary`, and the legacy
+`chunk_end_exclusive` refer to the actual edit time. Final-pair vocabulary recall
+is still reported in full. Geometry diagnostics refer to the selected edit input:
+prefix writes for protected context chunks, full chunk updates elsewhere.

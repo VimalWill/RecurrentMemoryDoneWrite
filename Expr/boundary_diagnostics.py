@@ -19,7 +19,8 @@ class BoundaryProbes:
         self.pairs = pairs
         self.totals = {}
 
-    def observe(self, layer, start, end, keys, values, writes, before, after, basis):
+    def observe(self, layer, start, end, keys, values, writes, before, after, basis, scheduled_end=None):
+        scheduled_end = end if scheduled_end is None else scheduled_end
         # Probe only full context chunks. Never treat query/filler tokens as pairs.
         if end > 2 * self.pairs:
             return
@@ -44,19 +45,22 @@ class BoundaryProbes:
         sums = torch.stack(metrics, -1).sum((0, 2)).detach().cpu().tolist()
         count = keys.shape[0] * keys.shape[2]
         for token, row in zip(indices.tolist(), sums):
-            key = (layer, start, end, token // 2 + 1)
+            key = (layer, start, end, scheduled_end, token // 2 + 1)
             previous = self.totals.setdefault(key, [0.] * 7)
             for i, value in enumerate([count, *row]):
                 previous[i] += value
 
     def report(self):
         rows = []
-        for (layer, start, end, pair), sums in sorted(self.totals.items()):
+        for (layer, start, end, scheduled_end, pair), sums in sorted(self.totals.items()):
             count, pre, post, target, drift, key_share, gain_share = sums
             rows.append(dict(
                 layer=layer, chunk_start=start, chunk_end_exclusive=end,
+                scheduled_chunk_end_exclusive=scheduled_end, edit_token_index=end,
                 pair_position=pair, value_token_index=2 * pair - 1,
                 tokens_before_boundary=end - 2 * pair, terminal_pair=2 * pair == end,
+                scheduled_terminal_pair=2 * pair == scheduled_end,
+                scheduled_penultimate_pair=2 * pair == scheduled_end - 2,
                 example_heads=int(count),
                 squared_error_before=pre / count, squared_error_after=post / count,
                 squared_error_change=(post - pre) / count,
@@ -70,11 +74,16 @@ class BoundaryProbes:
         return rows
 
 
-def summarize_positions(report, seq_len, pairs, chunk, offset, ranges):
-    """Separate pairs immediately preceding eligible context edits from other pairs."""
+def summarize_positions(report, seq_len, pairs, chunk, offset, ranges, tail_policy="none"):
+    """Keep logical chunk groups fixed when moving the edit before the final pair."""
     terminal = {end // 2 for start, end in ranges(seq_len, chunk, offset)
                 if start > 0 and end < seq_len and end <= 2 * pairs and end % 2 == 0}
     rows = report["recall_by_pair_position"]
+    penultimate = {p - 1 for p in terminal if p > 1}
+    edit_terminal = {((end - 2) if tail_policy == "before_pair" else end) // 2
+                     for start, end in ranges(seq_len, chunk, offset)
+                     if start > 0 and end < seq_len and end <= 2 * pairs
+                     and end % 2 == 0}
 
     def aggregate(selected):
         correct = sum(row["correct"] for row in selected)
@@ -83,7 +92,12 @@ def summarize_positions(report, seq_len, pairs, chunk, offset, ranges):
 
     return dict(
         terminal_pair_positions=sorted(terminal),
+        penultimate_pair_positions=sorted(penultimate),
+        edit_terminal_pair_positions=sorted(edit_terminal),
         terminal=aggregate([row for row in rows if row["pair_position"] in terminal]),
+        penultimate=aggregate([row for row in rows if row["pair_position"] in penultimate]),
+        earlier=aggregate([row for row in rows if row["pair_position"] not in terminal | penultimate]),
+        edit_terminal=aggregate([row for row in rows if row["pair_position"] in edit_terminal]),
         other=aggregate([row for row in rows if row["pair_position"] not in terminal]),
         quarters=[aggregate(rows[i * pairs // 4:(i + 1) * pairs // 4]) for i in range(4)],
     )
@@ -119,12 +133,21 @@ def write_diagnostic_csvs(result, stem):
                 delta = entry.get("paired_sequence_delta") or {}
                 summaries.append(dict(
                     **prefix, chunk=entry["chunk"], chunk_offset=entry["chunk_offset"],
+                    tail_policy=entry.get("tail_policy", "none"),
                     accuracy=entry["accuracy"], replay_accuracy=row["settings"]["replay"]["accuracy"],
                     terminal_accuracy=summary["terminal"]["accuracy"],
                     replay_terminal_accuracy=baseline["terminal"]["accuracy"],
+                    penultimate_accuracy=summary["penultimate"]["accuracy"],
+                    replay_penultimate_accuracy=baseline["penultimate"]["accuracy"],
+                    earlier_accuracy=summary["earlier"]["accuracy"],
+                    replay_earlier_accuracy=baseline["earlier"]["accuracy"],
+                    edit_terminal_accuracy=summary["edit_terminal"]["accuracy"],
+                    replay_edit_terminal_accuracy=baseline["edit_terminal"]["accuracy"],
                     other_accuracy=summary["other"]["accuracy"],
                     replay_other_accuracy=baseline["other"]["accuracy"],
                     terminal_total=summary["terminal"]["total"], other_total=summary["other"]["total"],
+                    penultimate_total=summary["penultimate"]["total"], earlier_total=summary["earlier"]["total"],
+                    edit_terminal_total=summary["edit_terminal"]["total"],
                     paired_mean_delta=delta.get("mean_accuracy_delta"),
                     paired_standard_error=delta.get("standard_error"),
                 ))

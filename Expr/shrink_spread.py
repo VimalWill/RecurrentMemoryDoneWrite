@@ -226,21 +226,50 @@ def chunk_ranges(length, chunk, offset=0):
 
 
 def chunked_recurrence(q, k, v, alpha, write, scale, chunk: int, edit=None,
-                       offset: int = 0, probe=None) -> torch.Tensor:
+                       offset: int = 0, probe=None, tail_policy: str = "none",
+                       tail_context_tokens: int | None = None) -> torch.Tensor:
     """KDN memory token by token; at each chunk boundary the chunk's update may be edited."""
+    if tail_policy not in ("none", "keep_pair", "before_pair"):
+        raise ValueError(f"Unknown tail policy: {tail_policy}")
+    if tail_policy != "none" and (chunk < 4 or chunk % 2 or offset % 2):
+        raise ValueError("Pair protection requires even chunk >= 4 and even offset")
+    if tail_context_tokens is not None and (tail_context_tokens < 0 or tail_context_tokens % 2):
+        raise ValueError("tail_context_tokens must be a nonnegative even token count")
     # The model adapter enables BF16 autocast, including inside replacement
     # kernels. Keep replay, eigensolvers and NS arithmetic at their input precision.
     with torch.autocast(device_type=q.device.type, enabled=False):
-        return _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset, probe)
+        return _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset, probe,
+                                  tail_policy, tail_context_tokens)
 
 
-def _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset=0, probe=None):
+def apply_chunk_edit(state, update, edit, keys, write, start, at, probe):
+    """Replace only the selected chunk writes, preserving the pre-chunk carry."""
+    count = edit.count
+    edited = edit(keys, start, update, write=write)
+    after = state + (edited - update)
+    if edit.count > count:
+        if probe is not None:
+            probe(start, at, state, after, edit.last_basis)
+        if edit.first_effect_token is None:
+            edit.first_effect_token = at
+    return after
+
+
+def _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset=0, probe=None,
+                        tail_policy="none", tail_context_tokens=None):
     batch, length, heads, key_dim = q.shape
     state = q.new_zeros(batch, heads, key_dim, v.shape[-1])
     outputs = torch.empty_like(v)
     for start, end in chunk_ranges(length, chunk, offset):
         update = torch.zeros_like(state) if edit is not None else None
+        # In MQAR, query/filler chunks have no KV pairs. Keep their intervention
+        # rule identical to the ordinary shrink control to isolate context edits.
+        policy = tail_policy if tail_context_tokens is None or end <= tail_context_tokens else "none"
+        tail_start = end - 2 if policy != "none" else end
         for t in range(start, end):
+            if edit is not None and policy == "before_pair" and t == tail_start and end < length:
+                # The final pair's error-driven writes see the already edited state.
+                state = apply_chunk_edit(state, update, edit, k, write, start, t, probe)
             state = alpha[:, t, ..., None] * state
             delta = v[:, t] - torch.einsum("bhk,bhkv->bhv", k[:, t], state)
             increment = write[:, t, ..., None] * delta[..., None, :]
@@ -248,17 +277,14 @@ def _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset=0, pro
             if edit is not None:
                 # Accumulate decayed writes directly: subtracting two large
                 # states to recover a small dS can lose the update entirely.
-                update = alpha[:, t, ..., None] * update + increment
+                update = alpha[:, t, ..., None] * update
+                if t < tail_start:
+                    # For keep_pair, continue decaying the prefix through the
+                    # last two tokens, but never add their writes to the edit.
+                    update = update + increment
             outputs[:, t] = scale * torch.einsum("bhk,bhkv->bhv", q[:, t], state)
-        if edit is not None and end < length:
-            count = edit.count
-            edited = edit(k, start, update, write=write)
-            before = state
-            state = state + (edited - update)
-            if probe is not None and edit.count > count:
-                probe(start, end, before, state, edit.last_basis)
-            if edit.count > count and edit.first_effect_token is None:
-                edit.first_effect_token = end
+        if edit is not None and end < length and policy != "before_pair":
+            state = apply_chunk_edit(state, update, edit, k, write, start, end, probe)
     if not torch.isfinite(outputs).all():
         raise FloatingPointError("Nonfinite outputs in shrink/spread recurrence")
     return outputs
@@ -307,6 +333,12 @@ def settings_grid(args, kind: str) -> list[dict]:
                 add("keys", gamma, eta)
             for eta in (0.05, 0.1):
                 add("none", 1., eta)
+        elif preset == "protect-pair":
+            add("keys", 0.1, 0.)
+            for policy in ("keep_pair", "before_pair"):
+                add("keys", 0.1, 0.)
+                grid[-1]["tail_policy"] = policy
+                grid[-1]["name"] += f"-{policy}"
         else:
             raise ValueError(f"Unknown preset: {preset}")
         return grid
@@ -440,6 +472,12 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
               "preset": getattr(args, "preset", "sweep"), "inference_only": True,
               "boundary_probe_definition": "value-token memory key rereads internal value at edit boundary; not vocabulary recall",
               "boundary_phase": "initial unedited chunk has length chunk + offset; later chunks have length chunk",
+              "tail_policies": {
+                  "none": "edit all current-chunk writes at the scheduled boundary",
+                  "keep_pair": "edit only the decayed prefix writes at the boundary; preserve final two token writes",
+                  "before_pair": "edit prefix writes before final two tokens; their residuals use the edited state"},
+              "tail_policy_scope": "chunks wholly inside KV context only; query/filler and context-crossing chunks use ordinary shrink",
+              "geometry_update_scope": "diagnostics describe the selected edit input (prefix writes for protected context chunks)",
               "seed": args.seed, "direction_window": "past_only", "checkpoint_spec": checkpoint_spec(checkpoint),
               "pair_position_definition": "1-based order in the original key-value context",
               "gain_moment": "centered covariance of raw write gain vectors",
@@ -484,6 +522,7 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
             probes = BoundaryProbes(pairs) if probes_enabled else None
             chunk = setting.get("chunk", args.chunk)
             offset = setting.get("chunk_offset", getattr(args, "chunk_offset", 0))
+            tail_policy = setting.get("tail_policy", "none")
             layer_index = 0
 
             def run(call, setting=setting, edits=edits):
@@ -498,10 +537,12 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
                                      setting["eta"], args.power_steps, args.seed, setting["directions"])
                     edits.append(edit)
                 return chunked_recurrence(call["q"], call["k"], call["v"], alpha, call["write"],
-                                          call["scale"], chunk, edit, offset=offset,
+                                          call["scale"], chunk, edit, offset=offset, tail_policy=tail_policy,
+                                          tail_context_tokens=2 * pairs,
                                           probe=(lambda start, end, before, after, basis:
                                                  probes.observe(layer, start, end, call["k"], call["v"],
-                                                                call["write"], before, after, basis))
+                                                                call["write"], before, after, basis,
+                                                                scheduled_end=min(start + chunk, call["k"].shape[1])))
                                           if probes is not None else None)
 
             recall = Recall(pairs, per_example=probes_enabled)
@@ -518,12 +559,12 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
                         if edit.first_effect_token is not None:
                             exposed += ((labels != -100) & (positions >= edit.first_effect_token)).sum().item()
             entry = {**recall.report(), **{k: v for k, v in setting.items() if k != "name"}}
-            entry.update(chunk=chunk, chunk_offset=offset)
-            entry["position_summary"] = summarize_positions(entry, seq_len, pairs, chunk, offset, chunk_ranges)
+            entry.update(chunk=chunk, chunk_offset=offset, tail_policy=tail_policy)
+            entry["position_summary"] = summarize_positions(entry, seq_len, pairs, chunk, offset, chunk_ranges, tail_policy)
             # Use the same positions for replay even when this setting shifts boundaries.
             baseline = entry if setting["name"] == "replay" else row["settings"]["replay"]
             entry["replay_position_summary"] = summarize_positions(
-                baseline, seq_len, pairs, chunk, offset, chunk_ranges)
+                baseline, seq_len, pairs, chunk, offset, chunk_ranges, tail_policy)
             entry["paired_sequence_delta"] = paired_sequence_delta(entry, baseline)
             if probes is not None:
                 entry["boundary_probes"] = probes.report()
@@ -561,8 +602,8 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=64, help="filter checkpoint key head size (default: 64)")
     parser.add_argument("--lr", type=float, default=1e-2, help="filter checkpoint training LR (default: 1e-2)")
     parser.add_argument("--plan-only", action="store_true", help="inspect matching checkpoints/settings without CUDA")
-    parser.add_argument("--preset", choices=("sweep", "boundary", "gentle"), default="sweep",
-                        help="boundary: 8 settings including baselines; gentle: 10; both fix edit parameters")
+    parser.add_argument("--preset", choices=("sweep", "boundary", "gentle", "protect-pair"), default="sweep",
+                        help="settings including baselines: boundary 8, gentle 10, protect-pair 5; presets fix edit parameters")
     parser.add_argument("--out", type=Path, help="defaults to Expr/results/shrink_spread[_PRESET]")
     parser.add_argument("--slices", help="seq_len:num_kv_pairs; focused presets default to 512:128,1024:256")
     parser.add_argument("--windows", type=ints, default=[256])
@@ -628,7 +669,8 @@ def main() -> None:
         if focused or args.plan_only:
             for setting in settings:
                 print(f"  {setting['name']}: chunk={setting.get('chunk', args.chunk)}, "
-                      f"offset={setting.get('chunk_offset', args.chunk_offset)}")
+                      f"offset={setting.get('chunk_offset', args.chunk_offset)}, "
+                      f"tail_policy={setting.get('tail_policy', 'none')}")
         if args.plan_only:
             continue
         if not torch.cuda.is_available():

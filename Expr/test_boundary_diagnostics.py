@@ -156,6 +156,128 @@ class BoundaryDiagnosticTests(unittest.TestCase):
         self.assertEqual({s["eta"] for s in gentle}, {0., 0.05, 0.1})
         self.assertEqual(sum(s["directions"] == "none" for s in gentle), 3)  # Replay plus two spread controls.
 
+    def test_pair_protection_preserves_carry_and_allows_tail_residual_correction(self):
+        q = k = alpha = torch.ones(1, 9, 1, 1)
+        v = torch.tensor([1., 2., 3., 4., 5., 6., 7., 8., 0.]).view_as(q)
+        write = torch.ones_like(q)
+        write[:, -1] = 0  # Read the carried state without writing again.
+        for policy, expected, first in (("none", 4., 8), ("keep_pair", 6., 8), ("before_pair", 8., 6)):
+            edit = self.edit(0.)
+            probes = BoundaryProbes(4)
+            def observe(start, at, before, after, basis):
+                probes.observe(0, start, at, k, v, write, before, after, basis, scheduled_end=8)
+            actual = chunked_recurrence(q, k, v, alpha, write, 1., 4, edit,
+                                       tail_policy=policy, probe=observe)
+            self.assertEqual(actual[0, -1, 0, 0].item(), expected)
+            self.assertEqual(edit.first_effect_token, first)
+            rows = probes.report()
+            if policy == "before_pair":
+                self.assertEqual([r["pair_position"] for r in rows], [3])
+                self.assertTrue(rows[0]["scheduled_penultimate_pair"])
+                self.assertFalse(rows[0]["scheduled_terminal_pair"])
+                self.assertEqual(rows[0]["edit_token_index"], 6)
+            else:
+                self.assertEqual([r["pair_position"] for r in rows], [3, 4])
+            # The last sequence chunk is never edited.
+            self.assertEqual(edit.count, 1)
+
+    def test_preserved_pair_excludes_both_writes_and_decays_prefix_per_channel(self):
+        q, k, v, _, write = [t[:1, :9, :1].double() for t in self.tensors(9)]
+        alpha = torch.linspace(0.6, 0.99, q.numel(), dtype=q.dtype).reshape_as(q)
+        write[:, 8] = 0
+        state = torch.zeros(1, 1, 4, 4, dtype=q.dtype)
+        increments = []
+        for t in range(8):
+            state = alpha[:, t, ..., None] * state
+            residual = v[:, t] - torch.einsum("bhk,bhkv->bhv", k[:, t], state)
+            inc = write[:, t, ..., None] * residual[..., None, :]
+            state = state + inc
+            increments.append(inc)
+        prefix = sum(alpha[:, t+1:8].prod(1)[..., None] * increments[t] for t in (4, 5))
+
+        class Edit:
+            count = 0
+            first_effect_token = None
+            def __call__(self, keys, start, update, write=None):
+                if start == 0:
+                    return update
+                self.received = update.clone()
+                self.count += 1
+                return 0.3 * update
+
+        edit = Edit()
+        actual = chunked_recurrence(q, k, v, alpha, write, 0.5, 4, edit, tail_policy="keep_pair")
+        torch.testing.assert_close(edit.received, prefix, rtol=1e-12, atol=1e-12)
+        expected_state = alpha[:, 8, ..., None] * (state - 0.7 * prefix)
+        expected_read = 0.5 * torch.einsum("bhk,bhkv->bhv", q[:, 8], expected_state)
+        torch.testing.assert_close(actual[:, 8], expected_read, rtol=1e-12, atol=1e-12)
+
+    def test_pair_policies_are_identity_when_disabled_and_use_only_past(self):
+        tensors = self.tensors()
+        baseline = chunked_recurrence(*tensors, 0.5, 16)
+        for policy in ("keep_pair", "before_pair"):
+            for offset in (0, 2):
+                identity = chunked_recurrence(*tensors, 0.5, 16, self.edit(1.), offset, tail_policy=policy)
+                torch.testing.assert_close(identity, baseline, rtol=0, atol=0)
+                edit = self.edit()
+                actual = chunked_recurrence(*tensors, 0.5, 16, edit, offset, tail_policy=policy)
+                first = 32 + offset - (2 if policy == "before_pair" else 0)
+                self.assertEqual(edit.first_effect_token, first)
+                torch.testing.assert_close(actual[:, :first], baseline[:, :first], rtol=0, atol=0)
+                changed = [t.clone() for t in tensors]
+                changed[1][:, first:] *= -3
+                changed[2][:, first:] += 100
+                future = chunked_recurrence(*changed, 0.5, 16, self.edit(), offset, tail_policy=policy)
+                torch.testing.assert_close(future[:, :first], actual[:, :first], rtol=0, atol=0)
+                probe = BoundaryProbes(32)
+                observed = chunked_recurrence(*tensors, 0.5, 16, self.edit(), offset,
+                    probe=lambda start, end, pre, post, basis:
+                        probe.observe(0, start, end, tensors[1], tensors[2], tensors[4], pre, post, basis),
+                    tail_policy=policy)
+                torch.testing.assert_close(observed, actual, rtol=0, atol=0)
+
+    def test_protected_pair_summary_catches_loss_moving_to_penultimate(self):
+        recall = Recall(128)
+        recall.total[:] = 1
+        recall.correct[:] = 1
+        recall.correct[14] = 0  # Pair 15, immediately before the earlier edit.
+        report = recall.report()
+        ordinary = summarize_positions(report, 512, 128, 16, 0, chunk_ranges)
+        early = summarize_positions(report, 512, 128, 16, 0, chunk_ranges, "before_pair")
+        self.assertEqual(ordinary["terminal_pair_positions"], early["terminal_pair_positions"])
+        self.assertEqual(early["edit_terminal_pair_positions"], list(range(15, 128, 8)))
+        self.assertEqual(early["terminal"]["accuracy"], 1.)
+        self.assertEqual(early["penultimate"]["correct"], 14)
+        self.assertEqual(early["penultimate"], early["edit_terminal"])
+        self.assertEqual(sum(early[g]["total"] for g in ("terminal", "penultimate", "earlier")), 128)
+
+    def test_protect_pair_preset_is_five_settings_with_no_spreading(self):
+        grid = settings_grid(SimpleNamespace(preset="protect-pair"), "iso_kdn")
+        self.assertEqual(len(grid) + 1, 5)
+        self.assertEqual(len({s["name"] for s in grid}), 4)
+        self.assertEqual({s.get("tail_policy", "none") for s in grid}, {"none", "keep_pair", "before_pair"})
+        self.assertTrue(all(s["eta"] == 0 for s in grid))
+        for setting in grid[1:]:
+            self.assertEqual((setting["gamma"], setting["rank"], setting["chunk"]), (0.1, 1, 16))
+        for chunk, offset, policy in ((3, 0, "keep_pair"), (2, 0, "before_pair"),
+                                      (16, 1, "keep_pair"), (16, 0, "typo")):
+            with self.assertRaises(ValueError):
+                chunked_recurrence(*self.tensors(), 0.5, chunk, self.edit(), offset, tail_policy=policy)
+
+    def test_protection_is_context_only_with_ordinary_query_chunk_edits(self):
+        tensors = self.tensors(65)
+        for policy, expected_times in (("keep_pair", [32, 48, 64]), ("before_pair", [30, 48, 64])):
+            times = []
+            chunked_recurrence(*tensors, 0.5, 16, self.edit(), tail_policy=policy,
+                               tail_context_tokens=32,
+                               probe=lambda start, end, pre, post, basis: times.append(end))
+            self.assertEqual(times, expected_times)
+            # With no complete context chunk eligible, both policies are ordinary shrink.
+            expected = chunked_recurrence(*tensors, 0.5, 16, self.edit())
+            actual = chunked_recurrence(*tensors, 0.5, 16, self.edit(), tail_policy=policy,
+                                       tail_context_tokens=30)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_checkpoint_loop_exports_shifted_probes_with_stable_layer_ids(self):
         # Exercise orchestration with real CPU recurrence/probes and synthetic
         # model/data adapters; CUDA kernels and actual checkpoints are HPC checks.
@@ -215,6 +337,8 @@ class BoundaryDiagnosticTests(unittest.TestCase):
              patch("shrink_spread.choose_gate", return_value=(2., None, 0.)), \
              patch.object(torch.Tensor, "cuda", lambda x: x), redirect_stdout(io.StringIO()):
             result = run_checkpoint(Path("fake.pt"), [(64, 16)], settings_grid(args, "iso_kdn"), args, checkpoint)
+            args.preset = "protect-pair"
+            protected = run_checkpoint(Path("fake.pt"), [(64, 16)], settings_grid(args, "iso_kdn"), args, checkpoint)
         self.assertTrue(model.frozen)
         settings = result["slices"][0]["settings"]
         ordinary = settings["keys-w256-r1-g0.1-e0-c16-o0"]
@@ -226,6 +350,19 @@ class BoundaryDiagnosticTests(unittest.TestCase):
         self.assertEqual(shifted["replay_position_summary"]["terminal"]["total"], 0)
         self.assertEqual(len(ordinary["per_example_correct_by_pair"]), 3)
         json.dumps(json_safe(result), allow_nan=False)
+        protected_settings = protected["slices"][0]["settings"]
+        self.assertEqual(len(protected_settings), 5)
+        early = protected_settings["keys-w256-r1-g0.1-e0-c16-o0-before_pair"]
+        kept = protected_settings["keys-w256-r1-g0.1-e0-c16-o0-keep_pair"]
+        self.assertEqual((early["first_effect_token"], kept["first_effect_token"]), (30, 32))
+        self.assertEqual({p["scheduled_chunk_end_exclusive"] for p in early["boundary_probes"]}, {32})
+        self.assertEqual({p["edit_token_index"] for p in early["boundary_probes"]}, {30})
+        self.assertEqual(early["position_summary"]["terminal"]["total"], 3)
+        self.assertEqual(early["position_summary"]["penultimate"]["total"], 3)
+        self.assertEqual(early["position_summary"]["edit_terminal"], early["position_summary"]["penultimate"])
+        self.assertEqual(len(early["boundary_probes"]), 14)  # Seven prefix pairs, two layers.
+        self.assertEqual(len(kept["boundary_probes"]), 16)  # Final pair is present at the later edit.
+        json.dumps(json_safe(protected), allow_nan=False)
         with tempfile.TemporaryDirectory() as directory:
             paths = write_diagnostic_csvs(result, Path(directory) / "fake")
             self.assertEqual(len(paths), 2)
@@ -233,6 +370,12 @@ class BoundaryDiagnosticTests(unittest.TestCase):
                 summary = list(csv.DictReader(stream))
             self.assertEqual(len(summary), 7)
             self.assertEqual(summary[0]["setting"], "replay")
+            paths = write_diagnostic_csvs(protected, Path(directory) / "protected")
+            with paths[0].open() as stream:
+                summary = list(csv.DictReader(stream))
+            self.assertEqual(summary[-1]["tail_policy"], "before_pair")
+            self.assertEqual(summary[-1]["penultimate_total"], "3")
+            self.assertIn("replay_earlier_accuracy", summary[-1])
 
 
 if __name__ == "__main__":
