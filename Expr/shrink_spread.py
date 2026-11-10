@@ -48,6 +48,11 @@ edit could affect reads, not whether that setting actually changed predictions.
 
 Usage:
   python Expr/shrink_spread.py /path/to/*.pt --out Expr/results/shrink_spread
+  python Expr/shrink_spread.py /path/to/checkpoint.pt --preset boundary
+
+Focused presets default to 32 examples and slices 512:128,1024:256, and save
+boundary probes plus per-example correctness for paired sequence comparisons.
+All runs are inference only; checkpoint parameters are never updated.
 """
 from __future__ import annotations
 
@@ -65,6 +70,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from metrics import effective_rank  # noqa: E402
+from boundary_diagnostics import (  # noqa: E402
+    BoundaryProbes, paired_sequence_delta, summarize_positions, write_diagnostic_csvs,
+)
 from state_geometry import (  # noqa: E402
     DEFAULT_SLICES,
     build_model,
@@ -141,11 +149,13 @@ class ChunkEdit:
         self.totals = {name: 0.0 for name in DIAGNOSTICS}
         self.count = 0
         self.first_effect_token = None
+        self.last_basis = None
 
     def __call__(self, keys: torch.Tensor, start: int, update: torch.Tensor,
                  write: torch.Tensor | None = None) -> torch.Tensor:
         """keys/write [B, T, H, K]; update [B, H, K, V]. Never use vectors at or after start."""
         source = keys
+        self.last_basis = None
         if self.directions == "gains":
             if write is None or write.shape != keys.shape:
                 raise ValueError("Gain directions require write vectors with the key tensor's shape")
@@ -183,6 +193,7 @@ class ChunkEdit:
             exact = torch.linalg.eigvalsh(moment)[..., -self.rank:].sum(-1) / trace
             quality = captured / exact.clamp_min(1e-12)
 
+        self.last_basis = basis if self.directions != "none" else None
         shrunk = update - (1 - self.gamma) * basis @ (basis.mT @ update)
         edited = shrunk if self.eta == 0 else (1 - self.eta) * shrunk + self.eta * newton_schulz5(shrunk)
 
@@ -203,22 +214,31 @@ class ChunkEdit:
         return {name: (value / self.count if self.count else math.nan) for name, value in self.totals.items()}
 
 
-def chunked_recurrence(q, k, v, alpha, write, scale, chunk: int, edit=None) -> torch.Tensor:
+def chunk_ranges(length, chunk, offset=0):
+    """Shift the boundary phase by extending the initial, unedited warm-up chunk."""
+    if chunk < 1 or not 0 <= offset < chunk:
+        raise ValueError("chunk must be positive and offset must satisfy 0 <= offset < chunk")
+    start = 0
+    end = min(length, chunk + offset)
+    while start < length:
+        yield start, end
+        start, end = end, min(length, end + chunk)
+
+
+def chunked_recurrence(q, k, v, alpha, write, scale, chunk: int, edit=None,
+                       offset: int = 0, probe=None) -> torch.Tensor:
     """KDN memory token by token; at each chunk boundary the chunk's update may be edited."""
-    if chunk < 1:
-        raise ValueError("chunk must be positive")
     # The model adapter enables BF16 autocast, including inside replacement
     # kernels. Keep replay, eigensolvers and NS arithmetic at their input precision.
     with torch.autocast(device_type=q.device.type, enabled=False):
-        return _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit)
+        return _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset, probe)
 
 
-def _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit):
+def _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit, offset=0, probe=None):
     batch, length, heads, key_dim = q.shape
     state = q.new_zeros(batch, heads, key_dim, v.shape[-1])
     outputs = torch.empty_like(v)
-    for start in range(0, length, chunk):
-        end = min(start + chunk, length)
+    for start, end in chunk_ranges(length, chunk, offset):
         update = torch.zeros_like(state) if edit is not None else None
         for t in range(start, end):
             state = alpha[:, t, ..., None] * state
@@ -233,7 +253,10 @@ def _chunked_recurrence(q, k, v, alpha, write, scale, chunk, edit):
         if edit is not None and end < length:
             count = edit.count
             edited = edit(k, start, update, write=write)
+            before = state
             state = state + (edited - update)
+            if probe is not None and edit.count > count:
+                probe(start, end, before, state, edit.last_basis)
             if edit.count > count and edit.first_effect_token is None:
                 edit.first_effect_token = end
     if not torch.isfinite(outputs).all():
@@ -268,6 +291,25 @@ def replace_kdn(run):
 
 def settings_grid(args, kind: str) -> list[dict]:
     grid = [dict(name="replay", directions="none", window=0, rank=0, gamma=1.0, eta=0.0)]
+    preset = getattr(args, "preset", "sweep")
+    if preset != "sweep":
+        def add(source, gamma, eta, chunk=16, offset=0):
+            grid.append(dict(
+                name=f"{source}-w256-r{0 if source == 'none' else 1}-g{gamma:g}-e{eta:g}-c{chunk}-o{offset}",
+                directions=source, window=256, rank=0 if source == "none" else 1,
+                gamma=gamma, eta=eta, chunk=chunk, chunk_offset=offset))
+        if preset == "boundary":
+            for chunk, offset in ((16, 0), (16, 2), (32, 0)):
+                for source in ("keys", "random"):
+                    add(source, 0.1, 0., chunk, offset)
+        elif preset == "gentle":
+            for gamma, eta in itertools.product((0.7, 0.9), (0., 0.05, 0.1)):
+                add("keys", gamma, eta)
+            for eta in (0.05, 0.1):
+                add("none", 1., eta)
+        else:
+            raise ValueError(f"Unknown preset: {preset}")
+        return grid
     sources = ("keys", "gains", "random") if kind == "diag_kdn" else ("keys", "random")
     for source, window, rank, gamma, eta in itertools.product(
             sources, args.windows, args.ranks, args.gammas, args.etas):
@@ -290,9 +332,11 @@ def query_pair_positions(inputs, labels, pairs):
 
 
 class Recall:
-    def __init__(self, pairs):
+    def __init__(self, pairs, per_example=False):
         self.correct = torch.zeros(pairs, dtype=torch.int64)
         self.total = torch.zeros_like(self.correct)
+        self.per_example = per_example
+        self.example_correct, self.example_total = [], []
 
     def update(self, predictions, labels, pair_positions):
         answer = labels != -100
@@ -300,14 +344,28 @@ class Recall:
         hits = predictions[answer] == labels[answer]
         self.total += torch.bincount(indices, minlength=len(self.total)).cpu()
         self.correct += torch.bincount(indices[hits], minlength=len(self.total)).cpu()
+        if self.per_example:
+            shape = (labels.shape[0], len(self.total))
+            counts = torch.zeros(shape, dtype=torch.int64, device=labels.device)
+            correct = torch.zeros_like(counts)
+            # Filler indices are -1; their zero weights prevent contamination.
+            counts.scatter_add_(1, pair_positions.clamp_min(0), answer.long())
+            correct.scatter_add_(1, pair_positions.clamp_min(0),
+                                 (answer & (predictions == labels)).long())
+            self.example_correct.extend(correct.cpu().tolist())
+            self.example_total.extend(counts.cpu().tolist())
 
     def report(self):
         total, correct = self.total.sum().item(), self.correct.sum().item()
-        return {"accuracy": correct / total if total else None, "correct": correct, "total": total,
+        report = {"accuracy": correct / total if total else None, "correct": correct, "total": total,
                 "recall_by_pair_position": [
                     {"pair_position": i + 1, "key_token_index": 2 * i,
                      "correct": c, "total": n, "accuracy": c / n if n else None}
                     for i, (c, n) in enumerate(zip(self.correct.tolist(), self.total.tolist()))]}
+        if self.per_example:
+            report.update(per_example_correct_by_pair=self.example_correct,
+                          per_example_total_by_pair=self.example_total)
+        return report
 
 
 def evaluate_batch(model, inputs, labels, pair_positions, recall):
@@ -372,9 +430,16 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
     if checkpoint is None:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     model = build_model(checkpoint)
+    model.requires_grad_(False)
     vocab_size = checkpoint["config"]["model"]["vocab_size"]
+    focused = getattr(args, "preset", "sweep") != "sweep"
+    probes_enabled = focused or getattr(args, "boundary_probes", False)
     result = {"checkpoint": str(path), "run_id": checkpoint["config"].get("run_id"),
               "best_epoch": checkpoint["epoch"], "chunk": args.chunk, "power_steps": args.power_steps,
+              "chunk_offset": getattr(args, "chunk_offset", 0),
+              "preset": getattr(args, "preset", "sweep"), "inference_only": True,
+              "boundary_probe_definition": "value-token memory key rereads internal value at edit boundary; not vocabulary recall",
+              "boundary_phase": "initial unedited chunk has length chunk + offset; later chunks have length chunk",
               "seed": args.seed, "direction_window": "past_only", "checkpoint_spec": checkpoint_spec(checkpoint),
               "pair_position_definition": "1-based order in the original key-value context",
               "gain_moment": "centered covariance of raw write gain vectors",
@@ -395,7 +460,7 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
             batches.append((inputs, labels, query_pair_positions(inputs, labels, pairs)))
         row = {"seq_len": seq_len, "num_kv_pairs": pairs, "examples": args.examples, "settings": {}}
 
-        recall = Recall(pairs)
+        recall = Recall(pairs, per_example=probes_enabled)
         worst_error = 0.0
         for inputs, labels, pair_positions in batches:
             calls = []
@@ -416,8 +481,15 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
 
         for setting in settings:
             edits = []
+            probes = BoundaryProbes(pairs) if probes_enabled else None
+            chunk = setting.get("chunk", args.chunk)
+            offset = setting.get("chunk_offset", getattr(args, "chunk_offset", 0))
+            layer_index = 0
 
             def run(call, setting=setting, edits=edits):
+                nonlocal layer_index
+                layer = layer_index
+                layer_index += 1
                 gate = gates[call["kind"]]
                 alpha = decode_alpha(call["g_cumsum"], gate[0], gate[1])
                 edit = None
@@ -426,12 +498,17 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
                                      setting["eta"], args.power_steps, args.seed, setting["directions"])
                     edits.append(edit)
                 return chunked_recurrence(call["q"], call["k"], call["v"], alpha, call["write"],
-                                          call["scale"], args.chunk, edit)
+                                          call["scale"], chunk, edit, offset=offset,
+                                          probe=(lambda start, end, before, after, basis:
+                                                 probes.observe(layer, start, end, call["k"], call["v"],
+                                                                call["write"], before, after, basis))
+                                          if probes is not None else None)
 
-            recall = Recall(pairs)
+            recall = Recall(pairs, per_example=probes_enabled)
             exposed = exposure_total = 0
             with replace_kdn(run):
                 for inputs, labels, pair_positions in batches:
+                    layer_index = 0
                     previous_edits = len(edits)
                     evaluate_batch(model, inputs, labels, pair_positions, recall)
                     total = (labels != -100).sum().item()
@@ -441,6 +518,15 @@ def run_checkpoint(path: Path, slices, settings, args, checkpoint=None) -> dict:
                         if edit.first_effect_token is not None:
                             exposed += ((labels != -100) & (positions >= edit.first_effect_token)).sum().item()
             entry = {**recall.report(), **{k: v for k, v in setting.items() if k != "name"}}
+            entry.update(chunk=chunk, chunk_offset=offset)
+            entry["position_summary"] = summarize_positions(entry, seq_len, pairs, chunk, offset, chunk_ranges)
+            # Use the same positions for replay even when this setting shifts boundaries.
+            baseline = entry if setting["name"] == "replay" else row["settings"]["replay"]
+            entry["replay_position_summary"] = summarize_positions(
+                baseline, seq_len, pairs, chunk, offset, chunk_ranges)
+            entry["paired_sequence_delta"] = paired_sequence_delta(entry, baseline)
+            if probes is not None:
+                entry["boundary_probes"] = probes.report()
             count = sum(edit.count for edit in edits)
             entry["evaluated_chunk_example_heads"] = count
             first_tokens = [edit.first_effect_token for edit in edits if edit.first_effect_token is not None]
@@ -475,28 +561,54 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=64, help="filter checkpoint key head size (default: 64)")
     parser.add_argument("--lr", type=float, default=1e-2, help="filter checkpoint training LR (default: 1e-2)")
     parser.add_argument("--plan-only", action="store_true", help="inspect matching checkpoints/settings without CUDA")
-    parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "results" / "shrink_spread")
-    parser.add_argument("--slices", default=DEFAULT_SLICES, help="seq_len:num_kv_pairs, comma-separated")
+    parser.add_argument("--preset", choices=("sweep", "boundary", "gentle"), default="sweep",
+                        help="boundary: 8 settings including baselines; gentle: 10; both fix edit parameters")
+    parser.add_argument("--out", type=Path, help="defaults to Expr/results/shrink_spread[_PRESET]")
+    parser.add_argument("--slices", help="seq_len:num_kv_pairs; focused presets default to 512:128,1024:256")
     parser.add_argument("--windows", type=ints, default=[256])
     parser.add_argument("--ranks", type=ints, default=[1, 2])
     parser.add_argument("--gammas", type=floats, default=[0.1, 0.3])
     parser.add_argument("--etas", type=floats, default=[0.0, 0.5])
     parser.add_argument("--chunk", type=int, default=16,
                         help="intervention chunk length, independent of kernel chunks (default: 16)")
+    parser.add_argument("--chunk-offset", type=int, default=0,
+                        help="extend initial warm-up by this many tokens to shift later boundaries")
+    parser.add_argument("--boundary-probes", action="store_true",
+                        help="save context reconstruction probes and per-example recall; automatic in focused presets")
     parser.add_argument("--power-steps", type=int, default=2)
-    parser.add_argument("--examples", type=int, default=128)
+    parser.add_argument("--examples", type=int, help="default: 128 for sweep, 32 for focused presets")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
+    focused = args.preset != "sweep"
+    if focused:
+        fixed = {"--windows", "--ranks", "--gammas", "--etas", "--chunk", "--chunk-offset"}
+        supplied = fixed & {arg.split("=", 1)[0] for arg in sys.argv[1:]}
+        if supplied:
+            parser.error(f"--preset {args.preset} fixes {', '.join(sorted(supplied))}; use --preset sweep to customize")
+    if args.examples is None:
+        args.examples = 32 if focused else 128
+    if args.slices is None:
+        args.slices = "512:128,1024:256" if focused else DEFAULT_SLICES
+    if args.out is None:
+        suffix = f"_{args.preset}" if focused else ""
+        args.out = Path(__file__).resolve().parent / "results" / f"shrink_spread{suffix}"
 
     if min(args.chunk, args.power_steps, args.examples, args.batch_size) < 1:
         parser.error("chunk, power-steps, examples and batch-size must be positive")
+    if not 0 <= args.chunk_offset < args.chunk:
+        parser.error("chunk-offset must satisfy 0 <= offset < chunk")
     if not args.windows or not args.ranks or any(x < 1 for x in args.windows + args.ranks):
         parser.error("windows and ranks must be nonempty positive integer lists")
     if not args.gammas or not args.etas or any(not 0 <= x <= 1 for x in args.gammas + args.etas):
         parser.error("gammas and etas must be nonempty lists of values in [0, 1]")
 
-    slices = [tuple(int(part) for part in item.split(":")) for item in args.slices.split(",")]
+    try:
+        slices = [tuple(int(part) for part in item.split(":")) for item in args.slices.split(",")]
+        if not slices or any(len(s) != 2 or s[1] < 1 or s[0] < 4 * s[1] for s in slices):
+            raise ValueError
+    except ValueError:
+        parser.error("slices must be seq_len:pairs entries with pairs >= 1 and seq_len >= 4*pairs")
     paths = sorted({p for path in args.checkpoints for p in (path.rglob("*.pt") if path.is_dir() else [path])})
     if not paths:
         parser.error("No checkpoint files found")
@@ -512,6 +624,11 @@ def main() -> None:
         selected += 1
         settings = settings_grid(args, spec["kind"])
         print(f"Selected {path}: {spec}; {len(settings) + 1} settings including kernel/replay")
+        print(f"Inference only; examples={args.examples}; slices={args.slices}; preset={args.preset}")
+        if focused or args.plan_only:
+            for setting in settings:
+                print(f"  {setting['name']}: chunk={setting.get('chunk', args.chunk)}, "
+                      f"offset={setting.get('chunk_offset', args.chunk_offset)}")
         if args.plan_only:
             continue
         if not torch.cuda.is_available():
@@ -523,8 +640,11 @@ def main() -> None:
         destination.write_text(json.dumps(json_safe(result), allow_nan=False, indent=1))
         pair_csv = args.out / f"{path.stem}-pair-recall.csv"
         write_pair_recall_csv(result, pair_csv)
+        diagnostic_paths = write_diagnostic_csvs(result, args.out / path.stem)
         print(f"Saved {destination}")
         print(f"Saved {pair_csv}")
+        for diagnostic_path in diagnostic_paths:
+            print(f"Saved {diagnostic_path}")
     if not selected:
         parser.error(f"No Iso/Diag checkpoints match H={args.heads}, d_k={args.head_dim}, LR={args.lr:g}")
 
