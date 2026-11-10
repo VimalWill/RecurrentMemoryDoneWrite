@@ -27,9 +27,6 @@ from zoology.model import LanguageModel
 from zoology.train import Trainer
 from zoology.utils import set_determinism
 
-import mqar_configs
-
-
 def parameter_groups(model: nn.Module, weight_decay: float) -> list:
     decay, no_decay = [], []
     for parameter in model.parameters():
@@ -43,11 +40,13 @@ def parameter_groups(model: nn.Module, weight_decay: float) -> list:
 
 
 class MQARTrainer(Trainer):
-    def __init__(self, *args, config: TrainConfig, grad_clip: float, checkpoint_path: Path, **kwargs):
+    def __init__(self, *args, config: TrainConfig, grad_clip: float, checkpoint_path: Path,
+                 fixed_budget: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.grad_clip = grad_clip
         self.checkpoint_path = checkpoint_path
+        self.fixed_budget = fixed_budget
 
     def train_epoch(self, epoch_idx: int) -> None:
         self.model.train()
@@ -64,8 +63,9 @@ class MQARTrainer(Trainer):
             iterator.set_postfix({"loss": loss.item(), "grad_norm": grad_norm})
             self.logger.log({"train/loss": loss.item(), "train/grad_norm": grad_norm, "epoch": epoch_idx})
 
-    def save_checkpoint(self, epoch_idx: int, metrics: dict) -> None:
-        temporary = self.checkpoint_path.with_suffix(".tmp")
+    def save_checkpoint(self, epoch_idx: int, metrics: dict, path: Path | None = None) -> None:
+        path = self.checkpoint_path if path is None else path
+        temporary = path.with_suffix(".tmp")
         torch.save(
             {
                 "model": self.model.state_dict(),
@@ -75,7 +75,7 @@ class MQARTrainer(Trainer):
             },
             temporary,
         )
-        temporary.replace(self.checkpoint_path)  # A job killed mid-save keeps the previous best.
+        temporary.replace(path)  # A job killed mid-save keeps the previous checkpoint.
 
     def fit(self) -> None:
         self.model.to(self.device)
@@ -96,13 +96,17 @@ class MQARTrainer(Trainer):
                 self.logger.log(
                     {"best/epoch": epoch_idx, **{k.replace("valid/", "best/"): v for k, v in metrics.items()}}
                 )
-            if accuracy > self.early_stopping_threshold:
+            if not self.fixed_budget and accuracy > self.early_stopping_threshold:
                 print(f"Early stopping at epoch {epoch_idx}: valid/accuracy {accuracy}")
                 break
             self.scheduler.step()
+        if self.fixed_budget:
+            self.save_checkpoint(epoch_idx, metrics,
+                                 self.checkpoint_path.with_suffix(".last.pt"))
 
 
-def train(config: TrainConfig, checkpoint_dir: Path, grad_clip: float) -> None:
+def train(config: TrainConfig, checkpoint_dir: Path, grad_clip: float,
+          *, fixed_budget: bool = False) -> None:
     set_determinism(config.seed)
     logger = WandbLogger(config)
     try:
@@ -110,6 +114,10 @@ def train(config: TrainConfig, checkpoint_dir: Path, grad_clip: float) -> None:
         config.print()
         model = LanguageModel(config.model)
         train_dataloader, test_dataloader = prepare_data(config.data)
+        if fixed_budget:
+            # Cache hits can consume a different amount of RNG during data
+            # preparation. Start the matched shuffle/dropout streams afresh.
+            set_determinism(config.seed)
         logger.log_model(model, config=config)
         MQARTrainer(
             model=model,
@@ -126,6 +134,7 @@ def train(config: TrainConfig, checkpoint_dir: Path, grad_clip: float) -> None:
             config=config,
             grad_clip=grad_clip,
             checkpoint_path=checkpoint_dir / f"{config.run_id}.pt",
+            fixed_budget=fixed_budget,
         ).fit()
     finally:
         logger.finish()
@@ -147,4 +156,5 @@ def main(configs: list) -> int:
 
 
 if __name__ == "__main__":
+    import mqar_configs
     raise SystemExit(main(mqar_configs.configs))

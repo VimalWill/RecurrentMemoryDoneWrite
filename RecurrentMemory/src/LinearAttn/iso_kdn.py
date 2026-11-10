@@ -98,6 +98,10 @@ class IsotropicKalmanDeltaNetwork(nn.Module):
         info_scale: float | None = None,
         norm_eps: float = 1e-5,
         layer_idx: int | None = None,
+        shrink_gamma: float | None = None,
+        shrink_chunk: int = 16,
+        shrink_window: int = 256,
+        shrink_rank: int = 1,
     ) -> None:
         for name, value in (
             ("hidden_size", hidden_size),
@@ -153,6 +157,13 @@ class IsotropicKalmanDeltaNetwork(nn.Module):
         self.key_dim = self.num_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.layer_idx = layer_idx
+        self.shrink_gamma = shrink_gamma
+        self.shrink_chunk = shrink_chunk
+        self.shrink_window = shrink_window
+        self.shrink_rank = shrink_rank
+        if shrink_gamma is not None:
+            from kdn_shrink import validate_shrink
+            validate_shrink(shrink_gamma, shrink_chunk, shrink_window, shrink_rank, head_dim)
         self.gate_dim = self.num_v_heads * self.head_k_dim
 
         # Preserve the pinned FLA KDA constructor's allocation and RNG order.
@@ -274,34 +285,45 @@ class IsotropicKalmanDeltaNetwork(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
         g_raw = rearrange(g_raw, "... (h d) -> ... h d", d=self.head_k_dim)
 
-        g_cumsum, a, omega, r, initial_precision = _iso_kdn_gate_precumsum_paired(
-            g_raw,
-            omega_r_raw,
-            self.omega_proj.bias.float(),
-            self.r_proj.bias.float(),
-            self.A_log.float(),
-            self.dt_bias.float(),
-            self.initial_precision_param.float(),
-            self.omega_min,
-            self.r_min,
-        )
-        gain = iso_kdn_gain(
-            a,
-            omega,
-            r,
-            initial_precision,
-            head_dim=self.head_k_dim,
-            out_dtype=torch.float32,
-            info_scale=self.info_scale,
-        )
+        if self.shrink_gamma is not None:
+            from kdn_shrink import iso_shrink_forward
+            output = iso_shrink_forward(
+                q, k, v, g_raw, omega_r_raw, self.omega_proj.bias,
+                self.r_proj.bias, self.A_log, self.dt_bias,
+                self.initial_precision_param, omega_min=self.omega_min,
+                r_min=self.r_min, info_scale=self.info_scale,
+                gamma=self.shrink_gamma, chunk=self.shrink_chunk,
+                window=self.shrink_window, rank=self.shrink_rank,
+            )
+        else:
+            g_cumsum, a, omega, r, initial_precision = _iso_kdn_gate_precumsum_paired(
+                g_raw,
+                omega_r_raw,
+                self.omega_proj.bias.float(),
+                self.r_proj.bias.float(),
+                self.A_log.float(),
+                self.dt_bias.float(),
+                self.initial_precision_param.float(),
+                self.omega_min,
+                self.r_min,
+            )
+            gain = iso_kdn_gain(
+                a,
+                omega,
+                r,
+                initial_precision,
+                head_dim=self.head_k_dim,
+                out_dtype=torch.float32,
+                info_scale=self.info_scale,
+            )
 
-        output = _chunk_kda_precumsum_paired(
-            q=q,
-            k=k,
-            v=v,
-            g_cumsum=g_cumsum,
-            beta=gain,
-        )
+            output = _chunk_kda_precumsum_paired(
+                q=q,
+                k=k,
+                v=v,
+                g_cumsum=g_cumsum,
+                beta=gain,
+            )
         output = self.o_norm(
             output,
             rearrange(
